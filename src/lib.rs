@@ -6,8 +6,9 @@
 //! Backslash escapes such as `\n` and `\043` are also supported.
 //! Text must be valid UTF-8, including after escapes are read.
 //!
-//! These checks are for the main control file, not per-version control files.
-//! They do not check SQL, database permissions, or compiled extensions.
+//! Version-specific controls are checked after applying them to the primary.
+//! SQL filenames describe possible installation paths; SQL contents, database
+//! permissions, and compiled extensions are not checked.
 //! CTL-001 asks for review; it does not prove a security flaw. No findings does
 //! not mean the extension is safe. We keep placeholders like `@CARGO_VERSION@`
 //! as they are, without checking whether packaging has replaced them.
@@ -18,7 +19,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 mod scan;
-pub use scan::{ScanError, ScanReport, SkippedFile, scan_extension};
+pub use scan::{
+    ExtensionReport, ScanError, ScanReport, SkippedFile, VersionReport, scan_extension,
+    scan_extension_with_base,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,6 +40,7 @@ pub struct Finding {
     pub cve_or_ref: Option<&'static str>,
     pub file: PathBuf,
     pub line: Option<usize>,
+    pub version: Option<String>,
     pub title: &'static str,
     pub details: String,
     pub remediation: &'static str,
@@ -45,6 +50,7 @@ pub struct Finding {
 pub struct ControlFile {
     pub path: PathBuf,
     pub entries: BTreeMap<String, (usize, String)>,
+    sources: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +92,11 @@ impl ControlFile {
             .map(|(line, val)| (*line, val.as_str()))
     }
 
+    /// File supplying a setting after version-specific overrides are applied.
+    pub fn source_path(&self, key: &str) -> &Path {
+        self.sources.get(key).map_or(&self.path, PathBuf::as_path)
+    }
+
     /// Return `Ok(None)` if the setting is missing, or an error if it is invalid.
     pub fn get_bool(&self, key: &str) -> Result<Option<(usize, bool)>, ControlError> {
         let Some((line, raw)) = self.get(key) else {
@@ -93,7 +104,7 @@ impl ControlFile {
         };
         let Some(value) = parse_bool(raw) else {
             return Err(control_error(
-                &self.path,
+                self.source_path(key),
                 line,
                 format!("invalid boolean for `{key}`: {raw:?}"),
             ));
@@ -240,7 +251,34 @@ fn parse_setting(line: &str) -> Result<(&str, String), String> {
 /// If a setting appears more than once, keep its last value.
 /// Stop at the first invalid line, even if a later line would replace it.
 pub fn parse_control_str(path: &Path, content: &str) -> Result<ControlFile, ControlError> {
-    let mut entries = BTreeMap::new();
+    let mut control = ControlFile {
+        path: path.to_path_buf(),
+        ..ControlFile::default()
+    };
+    apply_settings(&mut control, path, content, false)?;
+    validate_schema(&control)?;
+    Ok(control)
+}
+
+/// Apply one version's overrides to the primary, without carrying overrides
+/// from any other version. Cross-setting checks run on the combined settings.
+pub fn parse_version_control_str(
+    primary: &ControlFile,
+    path: &Path,
+    content: &str,
+) -> Result<ControlFile, ControlError> {
+    let mut control = primary.clone();
+    apply_settings(&mut control, path, content, true)?;
+    validate_schema(&control)?;
+    Ok(control)
+}
+
+fn apply_settings(
+    control: &mut ControlFile,
+    path: &Path,
+    content: &str,
+    secondary: bool,
+) -> Result<(), ControlError> {
     for (index, raw_line) in content.lines().enumerate() {
         let line_number = index + 1;
         if raw_line.contains('\0') {
@@ -256,14 +294,17 @@ pub fn parse_control_str(path: &Path, content: &str) -> Result<ControlFile, Cont
         }
         let (key, value) =
             parse_setting(line).map_err(|message| control_error(path, line_number, message))?;
-        entries.insert(key.to_owned(), (line_number, value));
+        if secondary && matches!(key, "directory" | "default_version") {
+            return Err(control_error(
+                path,
+                line_number,
+                format!("`{key}` cannot be set in a version-specific control file"),
+            ));
+        }
+        control.entries.insert(key.to_owned(), (line_number, value));
+        control.sources.insert(key.to_owned(), path.to_path_buf());
     }
-    let control = ControlFile {
-        path: path.to_path_buf(),
-        entries,
-    };
-    validate_schema(&control)?;
-    Ok(control)
+    Ok(())
 }
 
 fn validate_schema(control: &ControlFile) -> Result<(), ControlError> {
@@ -273,14 +314,14 @@ fn validate_schema(control: &ControlFile) -> Result<(), ControlError> {
     if let Some((line, schema)) = control.get("schema") {
         if schema.is_empty() {
             return Err(control_error(
-                &control.path,
+                control.source_path("schema"),
                 line,
                 "`schema` must not be empty",
             ));
         }
         if relocatable {
             return Err(control_error(
-                &control.path,
+                control.source_path("schema"),
                 line,
                 "`schema` cannot be combined with `relocatable = true`",
             ));
@@ -290,12 +331,17 @@ fn validate_schema(control: &ControlFile) -> Result<(), ControlError> {
 }
 
 /// CTL-001 asks for review when a trusted extension needs superuser installation
-/// and has no fixed schema. CTL-003 reports a missing or empty default version.
+/// and has no fixed schema. CTL-003 distinguishes missing and invalid defaults.
 /// Neither rule proves a security flaw. These checks do not inspect SQL or
 /// who can create objects in a schema.
 pub fn audit_control(control: &ControlFile) -> Result<Vec<Finding>, ControlError> {
-    let mut findings = Vec::new();
+    let mut findings = audit_installation_settings(control)?;
+    findings.extend(audit_default_version(control));
+    Ok(findings)
+}
 
+fn audit_installation_settings(control: &ControlFile) -> Result<Vec<Finding>, ControlError> {
+    let mut findings = Vec::new();
     validate_schema(control)?;
     let is_trusted = match control.get_bool("trusted")? {
         Some((_, value)) => value,
@@ -313,29 +359,66 @@ pub fn audit_control(control: &ControlFile) -> Result<Vec<Finding>, ControlError
             rule_id: "CTL-001",
             severity: Severity::Low,
             cve_or_ref: Some("https://www.postgresql.org/docs/current/extend-extensions.html#EXTEND-EXTENSIONS-SECURITY"),
-            file: control.path.clone(),
+            file: control.source_path("trusted").to_path_buf(),
             line,
+            version: None,
             title: "Review schema safety for trusted extension installation",
             details: "This extension requires superuser installation, is trusted, and has no fixed installation schema. When an eligible non-superuser installs it through the trusted mechanism, its scripts run as the bootstrap superuser. Unsafe object lookup could use user-controlled objects. These settings alone do not prove a vulnerability.".to_owned(),
             remediation: "Review installation and upgrade SQL for unsafe name lookup, including function and operator matching. Check schema ownership and CREATE permissions. A fixed schema alone does not guarantee safety.",
         });
     }
 
-    let version = control.get("default_version");
-    if version.is_none_or(|(_, value)| value.is_empty()) {
-        findings.push(Finding {
-            rule_id: "CTL-003",
-            severity: Severity::Medium,
-            cve_or_ref: None,
-            file: control.path.clone(),
-            line: version.map(|(line, _)| line),
-            title: "Control file has no usable `default_version`",
-            details: "The default version is missing or empty. `CREATE EXTENSION` without an explicit `VERSION` clause cannot select a valid default version. This is a configuration finding, not a security vulnerability.".to_owned(),
-            remediation: "Add `default_version = '...'` to the .control file.",
-        });
-    }
-
     Ok(findings)
+}
+
+fn audit_default_version(control: &ControlFile) -> Option<Finding> {
+    let (severity, line, title, details, remediation) = match control.get("default_version") {
+        None => (
+            Severity::Low,
+            None,
+            "No default version configured",
+            "Omitting `default_version` is allowed. CREATE EXTENSION requires an explicit VERSION clause when no default is configured.".to_owned(),
+            "Set `default_version` if installation without an explicit VERSION should be supported; otherwise document the required VERSION.",
+        ),
+        Some((line, value)) => {
+            let reason = name_error(value)?;
+            (
+                Severity::Medium,
+                Some(line),
+                "Invalid default version name",
+                format!("The default version {value:?} is unusable: {reason}. This is a configuration finding, not a security vulnerability."),
+                "Use a nonempty version label without double hyphens, leading/trailing hyphens, or directory separators. Semantic versioning is not required.",
+            )
+        }
+    };
+    Some(Finding {
+        rule_id: "CTL-003",
+        severity,
+        cve_or_ref: Some("https://www.postgresql.org/docs/18/extend-extensions.html"),
+        file: control.source_path("default_version").to_path_buf(),
+        line,
+        version: None,
+        title,
+        details,
+        remediation,
+    })
+}
+
+// PostgreSQL applies the same restrictions to extension and version names.
+fn name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("names must not be empty")
+    } else if name.contains("--") {
+        Some("names must not contain `--`")
+    } else if name.starts_with('-') || name.ends_with('-') {
+        Some("names must not start or end with `-`")
+    } else if name.contains(std::path::is_separator) {
+        Some("names must not contain directory separators")
+    } else if name.contains('\0') {
+        Some("names must not contain NUL")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

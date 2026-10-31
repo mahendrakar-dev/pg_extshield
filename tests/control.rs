@@ -1,4 +1,6 @@
-use pg_extshield::{ControlFile, Severity, audit_control, parse_control_str};
+use pg_extshield::{
+    ControlFile, Severity, audit_control, parse_control_str, parse_version_control_str,
+};
 use std::path::Path;
 
 fn parse(content: &str) -> ControlFile {
@@ -204,10 +206,135 @@ fn default_version_check_handles_missing_empty_and_source_template() {
         assert_eq!(findings.len(), usize::from(expected), "{content}");
         if expected {
             assert_eq!(findings[0].rule_id, "CTL-003");
-            assert_eq!(findings[0].severity, Severity::Medium);
+            assert_eq!(
+                findings[0].severity,
+                if line.is_some() {
+                    Severity::Medium
+                } else {
+                    Severity::Low
+                }
+            );
             assert_eq!(findings[0].line, line);
-            assert_eq!(findings[0].cve_or_ref, None);
+            assert!(findings[0].cve_or_ref.unwrap().contains("postgresql.org"));
         }
+    }
+}
+
+#[test]
+fn versions_are_opaque_labels_with_postgres_name_restrictions() {
+    for version in [
+        "beta",
+        "2026-10",
+        "0.1.0-alpha.1",
+        "1.0+build",
+        "1",
+        ".",
+        "..",
+        "  ",
+        "café",
+    ] {
+        let control = parse(&format!("default_version = '{version}'"));
+        assert!(audit_control(&control).unwrap().is_empty(), "{version}");
+    }
+    for version in ["", "-1.0", "1.0-", "1--2", "a/b", "../1.0"] {
+        let control = parse(&format!("# header\ndefault_version = '{version}'"));
+        let findings = audit_control(&control).unwrap();
+        assert_eq!(findings.len(), 1, "{version}");
+        assert_eq!(findings[0].rule_id, "CTL-003");
+        assert_eq!(findings[0].severity, Severity::Medium);
+        assert_eq!(findings[0].line, Some(2));
+        assert_eq!(findings[0].title, "Invalid default version name");
+    }
+    let control = parse(r"default_version = 'a\\b'");
+    assert_eq!(audit_control(&control).unwrap().is_empty(), !cfg!(windows));
+}
+
+#[test]
+fn missing_default_is_an_advisory_not_invalid_configuration() {
+    let findings = audit_control(&parse("")).unwrap();
+    assert_eq!(findings[0].severity, Severity::Low);
+    assert!(
+        findings[0]
+            .details
+            .contains("Omitting `default_version` is allowed")
+    );
+    assert!(findings[0].details.contains("explicit VERSION"));
+    assert_eq!(findings[0].line, None);
+}
+
+#[test]
+fn version_overrides_preserve_provenance_and_do_not_leak_between_versions() {
+    let primary = parse("default_version = '2.0'\ntrusted = false\nrequires = 'foo'");
+    let v2 = parse_version_control_str(
+        &primary,
+        Path::new("demo--2.0.control"),
+        "# override\ntrusted = true\nrequires = 'bar'",
+    )
+    .unwrap();
+    assert_eq!(v2.get("requires"), Some((3, "bar")));
+    assert_eq!(v2.get("default_version"), Some((1, "2.0")));
+    assert_eq!(v2.source_path("default_version"), Path::new("demo.control"));
+    let findings = audit_control(&v2).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].file, Path::new("demo--2.0.control"));
+    assert_eq!(findings[0].line, Some(2));
+
+    let v3 = parse_version_control_str(
+        &primary,
+        Path::new("demo--3.0.control"),
+        "comment = 'next release'",
+    )
+    .unwrap();
+    assert_eq!(v3.get_bool("trusted").unwrap(), Some((2, false)));
+    assert_eq!(v3.get("requires"), Some((3, "foo")));
+    assert!(audit_control(&v3).unwrap().is_empty());
+    assert_eq!(primary.get_bool("trusted").unwrap(), Some((2, false)));
+}
+
+#[test]
+fn secondary_controls_are_validated_after_merging_with_primary() {
+    let primary = parse("relocatable = true\ntrusted = true\ndefault_version = '1'");
+    let merged = parse_version_control_str(
+        &primary,
+        Path::new("demo--1.control"),
+        "schema = 'app'\nrelocatable = false",
+    )
+    .unwrap();
+    assert!(audit_control(&merged).unwrap().is_empty());
+
+    let error = parse_version_control_str(
+        &primary,
+        Path::new("demo--1.control"),
+        "# invalid inherited combination\nschema = 'app'",
+    )
+    .unwrap_err();
+    assert_eq!(error.file, Path::new("demo--1.control"));
+    assert_eq!(error.line, 2);
+    assert!(error.message.contains("relocatable"));
+
+    let primary = parse("schema = 'app'");
+    let error =
+        parse_version_control_str(&primary, Path::new("demo--1.control"), "relocatable = true")
+            .unwrap_err();
+    assert_eq!(error.file, Path::new("demo.control"));
+    assert_eq!(error.line, 1);
+}
+
+#[test]
+fn secondary_controls_reject_forbidden_or_invalid_assignments() {
+    for setting in [
+        "directory = 'sql'",
+        "default_version = '2.0'",
+        "trusted = typo\ntrusted = true",
+    ] {
+        let error = parse_version_control_str(
+            &parse("default_version = '1'"),
+            Path::new("demo--1.control"),
+            &format!("# header\n{setting}"),
+        )
+        .unwrap_err();
+        assert_eq!(error.file, Path::new("demo--1.control"));
+        assert_eq!(error.line, 2);
     }
 }
 

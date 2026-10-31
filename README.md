@@ -9,8 +9,9 @@ This is a standalone Rust tool, not a PostgreSQL extension. It reads files
 without loading or executing the extension. You do not need PostgreSQL or pgrx
 installed to use it.
 
-**Release status: 0.1.0-alpha.1 (experimental).** Currently, only primary
-`.control` files are checked. Rules and report formats may change.
+**Release status: 0.1.0-alpha.1 (experimental).** Checks primary and
+version-specific `.control` files and SQL filenames. Rules and report formats
+may change.
 
 ## Installation
 
@@ -24,7 +25,8 @@ The executable is created at `target/release/pg_extshield` on Linux.
 
 ## Usage
 
-Pass the folder containing the extension's primary control file:
+Pass the folder containing the extension's primary control file. Use the packaged
+layout, not a source tree that still needs build-time file generation:
 
 ```bash
 ./target/release/pg_extshield scan /path/to/extension
@@ -35,8 +37,9 @@ For example, a folder containing `demo.control`:
 ```text
 demo/
 ├── demo.control
-├── sql/
-└── src/
+├── demo--1.0.sql
+├── demo--1.0--1.1.sql
+└── demo--1.1.control
 ```
 
 The report includes rule IDs, severity, file locations, explanations, and
@@ -52,10 +55,67 @@ suggested actions. To see the available commands:
 | Rule | Level | What it reports |
 |---|---|---|
 | `CTL-001` | Low | A trusted extension that requires superuser installation and has no fixed schema. This asks for review; it does not prove a vulnerability. |
-| `CTL-003` | Medium | A missing or empty default version. This is a configuration issue, not a security vulnerability. |
+| `CTL-003` | Low / Medium | Missing default: advisory, because explicit `VERSION` is allowed. Empty or invalid default name: configuration issue (Medium). |
+| `CTL-004` | Medium | No installation path to a valid configured default, or no installation script at all when the default is omitted. |
 
 The scanner reports invalid settings and read errors instead of silently
 ignoring them. It stops at the first error and does not print a partial report.
+
+### Script directories and version paths
+
+When `directory` is omitted, scripts and secondary controls are looked for beside
+the primary control. Absolute directory paths are used directly.
+
+An explicit **relative** `directory` requires an installation base:
+
+```bash
+./target/release/pg_extshield scan /opt/postgres/share/extension \
+  --installation-base /opt/postgres/share
+```
+
+For `directory = 'demo_sql'`, this inventories `/opt/postgres/share/demo_sql`,
+not `/opt/postgres/share/extension/demo_sql`. The base is PostgreSQL's `SHAREDIR`
+or the corresponding custom `extension_control_path` base. The scanner does not
+guess this from a source folder, query a server, or search `extension_control_path`.
+Relative command-line paths are interpreted from the process working directory;
+absolute paths are recommended, especially for MCP.
+
+This follows the PostgreSQL 18 implementation of
+[`get_extension_script_directory`](https://github.com/postgres/postgres/blob/19a2002b5db959e095926d74d46be4b8aa7f20a2/src/backend/commands/extension.c#L567).
+The official documentation's control-folder-relative wording differs from that
+implementation for an explicitly relative `directory`.
+
+The scanner inventories `extension--version.sql` installation scripts and
+`extension--from--to.sql` directed update scripts. For example, default `1.2`
+can be reached using `demo--1.0.sql`, `demo--1.0--1.1.sql`, and
+`demo--1.1--1.2.sql`; a direct `demo--1.2.sql` is not required. Cycles without
+an installation script do not provide a fresh installation path.
+
+Version names are opaque, case-sensitive labels, not SemVer. Empty names, `--`,
+leading/trailing `-`, and native directory separators are invalid. No ordering
+or downgrade requirement is imposed. Malformed script/secondary filenames are
+reported as skipped and do not contribute to paths.
+
+Each known version (from scripts, secondary controls, or a valid default) is
+checked with the primary settings plus only its own optional
+`extension--version.control` overrides from the script directory. Overrides do
+not carry forward between versions. Secondary controls cannot set `directory`
+or `default_version`; schema/relocatable conflicts are checked after merging.
+Findings retain the supplying setting's file and line and identify the affected
+version. The primary baseline is checked on its own if no versions are known.
+
+The report's `extensions` array records each primary control, resolved script
+directory, inventoried scripts, default, and per-version checks. A version's
+`installation_path` is one shortest candidate path including its starting
+installation version, or `null` when no path exists. It is not a guarantee of
+PostgreSQL's tie-breaking choice, script execution success, or dependency
+availability. Non-default unreachable versions are visible in this array but
+do not produce a `CTL-004` finding by themselves.
+
+Missing installation-base input, missing/inaccessible script directories, and
+matching script/secondary entries that are not regular files cause explicit scan
+errors. They are not reported as missing installation paths. Primary symlink
+entries are skipped; matching script/secondary symlinks are not followed.
 
 Exit codes:
 
@@ -95,7 +155,7 @@ Available tools:
 | Tool | Input | Result |
 |---|---|---|
 | `server_status` | None | Confirms that the server responds. Does not scan files. |
-| `scan_extension` | `path`: extension folder path | Returns scanned files, skipped files, findings, rules checked, and notes. |
+| `scan_extension` | `path`: extension folder path; optional `installation_base` (required for relative `directory`) | Returns scanned controls, script inventories, version paths, skipped files, findings, rules checked, and notes. |
 
 Example assistant request:
 
@@ -111,13 +171,16 @@ Do not print debug messages to stdout in MCP mode; use stderr instead.
 ## Important notes
 
 - No findings does **not** mean the extension is safe.
-- Only primary control files directly inside the supplied folder are checked.
-- Subfolders and symbolic-link entries are not scanned.
-- Version-specific files such as `demo--1.1.control` are reported as skipped.
-- SQL, Rust/C source, compiled libraries, and database permissions are not checked.
-- Version comparisons, SQL checks, and binary checks are future work.
-- Source placeholders such as `@CARGO_VERSION@` are preserved. The scanner does
-  not yet verify that packaging has replaced them.
+- Primary controls are discovered directly inside the supplied folder. Only their
+  resolved script directories are additionally inventoried, without recursion.
+- Unpaired secondary controls or those outside the resolved script directory are
+  reported as skipped, not audited in isolation.
+- SQL contents, Rust/C source, compiled libraries, dependency availability, and
+  database permissions are not checked. Nothing from the extension is executed.
+- Source placeholders such as `@CARGO_VERSION@` are preserved and used literally
+  for filename matching. Build/package first; no template substitution is done.
+- Control text and relevant filenames must be valid UTF-8. This is not a full
+  PostgreSQL control-setting or SQL validator.
 
 ## Project structure
 
@@ -128,11 +191,11 @@ pg_extshield/
 ├── README.md         # Setup and usage
 ├── src/
 │   ├── lib.rs        # Control-file parser, rules, and shared types
-│   ├── scan.rs       # File scanning and report data; no printing
+│   ├── scan.rs       # Script inventory, version paths, and reports; no printing
 │   └── main.rs       # CLI commands, MCP tools, and output
 └── tests/
     ├── control.rs   # Parser and rule tests
-    └── cli.rs       # CLI tests and MCP calls over stdin/stdout
+    └── cli.rs       # Scanner/CLI tests and MCP calls over stdin/stdout
 ```
 
 Both the CLI and MCP server use the same scanning function.

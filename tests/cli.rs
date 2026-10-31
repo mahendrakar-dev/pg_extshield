@@ -46,13 +46,14 @@ impl Drop for TestFolder {
 fn reports_findings_with_details_locations_and_suggestions() {
     let folder = TestFolder::new();
     folder.write("demo.control", "# demo\ntrusted = true\n");
+    folder.write("demo--1.0.sql", "");
 
     let output = folder.scan();
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("[Low] CTL-001: Review schema safety"));
-    assert!(stdout.contains("[Medium] CTL-003:"));
+    assert!(stdout.contains("[Low] CTL-003:"));
     assert!(stdout.contains(&format!("{}:2", folder.path.join("demo.control").display())));
     assert!(stdout.contains("Details:"));
     assert!(stdout.contains("Suggestion:"));
@@ -66,6 +67,9 @@ fn checks_primary_files_in_order_and_skips_unsupported_inputs() {
     folder.write("z.control", "default_version = '1.0'\n");
     folder.write("a.control", "default_version = '1.0'\n");
     folder.write("a--1.1.control", "comment = 'override'\n");
+    folder.write("a--1.0.sql", "");
+    folder.write("z--1.0.sql", "");
+    folder.write("orphan--1.control", "comment = 'orphan'");
     folder.write("notes.txt", "not a control file");
     let subfolder = folder.path.join("ignored.control");
     std::fs::create_dir(&subfolder).unwrap();
@@ -81,12 +85,15 @@ fn checks_primary_files_in_order_and_skips_unsupported_inputs() {
         .lines()
         .filter(|line| line.starts_with("Checked control file:"))
         .collect();
-    assert_eq!(checked.len(), 2);
-    assert!(checked[0].ends_with("a.control"));
-    assert!(checked[1].ends_with("z.control"));
-    assert!(stdout.contains("Skipped version-specific control file:"));
-    assert!(stdout.contains("No findings from the current control-file checks."));
-    assert!(stdout.contains("Scanned 2 control file(s); 0 finding(s)."));
+    assert_eq!(checked.len(), 3);
+    assert!(checked[0].ends_with("a--1.1.control"));
+    assert!(checked[1].ends_with("a.control"));
+    assert!(checked[2].ends_with("z.control"));
+    assert!(stdout.contains("Skipped file:"));
+    assert!(
+        stdout.contains("No findings from the current control-file and script-filename checks.")
+    );
+    assert!(stdout.contains("Scanned 3 control file(s); 0 finding(s)."));
     assert!(!stdout.contains("CTL-003"));
 }
 
@@ -192,6 +199,329 @@ fn failed_scan_does_not_print_a_partial_report() {
     );
 }
 
+#[test]
+fn installation_paths_use_directed_updates_and_handle_cycles() {
+    let folder = TestFolder::new();
+    folder.write("demo.control", "default_version = 'release'");
+    for name in [
+        "demo--base.sql",
+        "demo--base--beta.sql",
+        "demo--beta--base.sql",
+        "demo--beta--release.sql",
+        "demo--isolated--other.sql",
+        "demo--other--isolated.sql",
+    ] {
+        // SQL contents are deliberately not readable as UTF-8.
+        folder.write(name, [0xff]);
+    }
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    assert!(report.findings.is_empty());
+    let extension = &report.extensions[0];
+    assert_eq!(extension.scripts.len(), 6);
+    let release = extension
+        .versions
+        .iter()
+        .find(|v| v.version == "release")
+        .unwrap();
+    assert_eq!(
+        release.installation_path,
+        Some(vec!["base".into(), "beta".into(), "release".into()])
+    );
+    let isolated = extension
+        .versions
+        .iter()
+        .find(|v| v.version == "isolated")
+        .unwrap();
+    assert_eq!(isolated.installation_path, None);
+
+    folder.write("demo--base--release.sql", "");
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    let release = report.extensions[0]
+        .versions
+        .iter()
+        .find(|v| v.version == "release")
+        .unwrap();
+    assert_eq!(
+        release.installation_path,
+        Some(vec!["base".into(), "release".into()])
+    );
+
+    folder.write("demo--release.sql", "");
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    let release = report.extensions[0]
+        .versions
+        .iter()
+        .find(|v| v.version == "release")
+        .unwrap();
+    assert_eq!(release.installation_path, Some(vec!["release".into()]));
+}
+
+#[test]
+fn unreachable_defaults_and_missing_install_scripts_are_distinct_from_invalid_defaults() {
+    let folder = TestFolder::new();
+    folder.write("demo.control", "# header\ndefault_version = '1.2'");
+    for name in ["demo--1.0.sql", "demo--1.0--1.1.sql", "demo--1.2--1.1.sql"] {
+        folder.write(name, "");
+    }
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.findings[0].rule_id, "CTL-004");
+    assert_eq!(report.findings[0].line, Some(2));
+    assert_eq!(report.findings[0].version.as_deref(), Some("1.2"));
+    let output = folder.scan();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("[Medium] CTL-004")
+    );
+
+    folder.write("demo.control", "default_version = 'bad--version'");
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.findings[0].rule_id, "CTL-003");
+    assert_eq!(report.findings[0].severity, pg_extshield::Severity::Medium);
+
+    std::fs::remove_file(folder.path.join("demo--1.0.sql")).unwrap();
+    folder.write("demo.control", "");
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    assert_eq!(report.findings.len(), 2);
+    assert_eq!(report.findings[0].rule_id, "CTL-003");
+    assert_eq!(report.findings[0].severity, pg_extshield::Severity::Low);
+    assert_eq!(report.findings[1].rule_id, "CTL-004");
+    assert!(report.findings[1].details.contains("Update scripts alone"));
+}
+
+#[test]
+fn update_cycles_without_an_installation_base_are_not_installable() {
+    let folder = TestFolder::new();
+    folder.write("demo.control", "default_version = 'beta'");
+    folder.write("demo--alpha--beta.sql", "");
+    folder.write("demo--beta--alpha.sql", "");
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.findings[0].rule_id, "CTL-004");
+    assert!(
+        report.extensions[0]
+            .versions
+            .iter()
+            .all(|v| v.installation_path.is_none())
+    );
+}
+
+#[test]
+fn version_labels_are_case_sensitive_and_scripts_cannot_cross_extensions() {
+    let folder = TestFolder::new();
+    folder.write("demo.control", "default_version = 'Beta'");
+    folder.write("demo--beta.sql", "");
+    folder.write("other--Beta.sql", "");
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    assert_eq!(report.findings[0].rule_id, "CTL-004");
+    assert_eq!(
+        report.extensions[0].scripts,
+        vec![folder.path.join("demo--beta.sql")]
+    );
+}
+
+#[test]
+fn malformed_filenames_are_reported_but_not_used_as_paths() {
+    let folder = TestFolder::new();
+    folder.write("demo.control", "default_version = '1'");
+    folder.write("demo--1.sql", "");
+    for name in [
+        "demo--.sql",
+        "demo---1.sql",
+        "demo--1-.sql",
+        "demo--1--2--3.sql",
+        "demo--.control",
+        "demo--1--2.control",
+    ] {
+        folder.write(name, "not read");
+    }
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    assert!(report.findings.is_empty());
+    assert_eq!(report.extensions[0].scripts.len(), 1);
+    assert_eq!(report.extensions[0].versions.len(), 1);
+    assert_eq!(report.skipped_files.len(), 6);
+    assert!(
+        report
+            .skipped_files
+            .iter()
+            .all(|f| f.reason.contains("Invalid extension filename"))
+    );
+}
+
+#[test]
+fn relative_directories_use_an_explicit_installation_base_in_cli_and_library() {
+    let folder = TestFolder::new();
+    let base = TestFolder::new();
+    std::fs::create_dir(base.path.join("scripts")).unwrap();
+    std::fs::create_dir(folder.path.join("scripts")).unwrap();
+    folder.write(
+        "demo.control",
+        "default_version = '1'\ndirectory = 'scripts'",
+    );
+    folder.write("scripts/demo--wrong.sql", "");
+    folder.write(
+        "demo--1.control",
+        "invalid but outside the script directory",
+    );
+    base.write("scripts/demo--1.sql", "");
+    base.write("scripts/demo--1.control", "# override\ntrusted = true");
+
+    let error = pg_extshield::scan_extension(&folder.path).unwrap_err();
+    assert!(error.to_string().contains("demo.control:2:"));
+    assert!(error.to_string().contains("installation base"));
+    let output = folder.scan();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("--installation-base")
+    );
+
+    let report = pg_extshield::scan_extension_with_base(&folder.path, Some(&base.path)).unwrap();
+    assert_eq!(
+        report.extensions[0].script_directory,
+        base.path.join("scripts")
+    );
+    assert_eq!(
+        report.extensions[0].scripts,
+        vec![base.path.join("scripts/demo--1.sql")]
+    );
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.findings[0].rule_id, "CTL-001");
+    assert_eq!(
+        report.findings[0].file,
+        base.path.join("scripts/demo--1.control")
+    );
+    assert_eq!(report.findings[0].line, Some(2));
+    assert_eq!(report.findings[0].version.as_deref(), Some("1"));
+    assert_eq!(report.skipped_files.len(), 1);
+    assert!(report.skipped_files[0].reason.contains("outside"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pg_extshield"))
+        .arg("scan")
+        .arg(&folder.path)
+        .arg("--installation-base")
+        .arg(&base.path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("candidate installation path 1"));
+    assert!(stdout.contains("demo--1.control:2"));
+    assert!(stdout.contains("Version: \"1\""));
+}
+
+#[test]
+fn absolute_script_directories_need_no_installation_base() {
+    let folder = TestFolder::new();
+    let scripts = TestFolder::new();
+    let directory = scripts
+        .path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "''");
+    folder.write(
+        "demo.control",
+        format!("default_version = '1'\ndirectory = '{directory}'"),
+    );
+    scripts.write("demo--1.sql", "");
+    scripts.write("demo--1.control", "comment = 'override'");
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    assert!(report.findings.is_empty());
+    assert_eq!(report.extensions[0].script_directory, scripts.path);
+    assert!(
+        report
+            .scanned_files
+            .contains(&scripts.path.join("demo--1.control"))
+    );
+}
+
+#[test]
+fn missing_or_non_directory_script_locations_are_errors_not_missing_script_findings() {
+    let folder = TestFolder::new();
+    folder.write("not_a_directory", "");
+    for directory in ["missing", "not_a_directory"] {
+        folder.write(
+            "demo.control",
+            format!("default_version = '1'\ndirectory = '{directory}'"),
+        );
+        let error =
+            pg_extshield::scan_extension_with_base(&folder.path, Some(&folder.path)).unwrap_err();
+        assert!(error.to_string().contains(directory));
+        assert!(!error.to_string().contains("CTL-004"));
+    }
+}
+
+#[test]
+fn effective_controls_are_audited_for_every_version_without_override_carryover() {
+    let folder = TestFolder::new();
+    folder.write("demo.control", "default_version = '3'\ntrusted = false");
+    folder.write("demo--1.sql", "");
+    folder.write("demo--1--2.sql", "");
+    folder.write("demo--2--3.sql", "");
+    folder.write("demo--2.control", "# override\ntrusted = true");
+    folder.write(
+        "demo--3.control",
+        "comment = 'back to the primary baseline'",
+    );
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.findings[0].rule_id, "CTL-001");
+    assert_eq!(report.findings[0].version.as_deref(), Some("2"));
+    assert_eq!(report.findings[0].file, folder.path.join("demo--2.control"));
+    assert_eq!(report.findings[0].line, Some(2));
+    assert_eq!(report.extensions[0].versions.len(), 3);
+
+    folder.write("demo.control", "default_version = '3'\ntrusted = true");
+    folder.write("demo--2.control", "superuser = false");
+    folder.write("demo--3.control", "schema = 'app'");
+    let report = pg_extshield::scan_extension(&folder.path).unwrap();
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.findings[0].version.as_deref(), Some("1"));
+    assert_eq!(report.findings[0].file, folder.path.join("demo.control"));
+}
+
+#[test]
+fn invalid_secondary_settings_fail_without_partial_cli_output() {
+    let folder = TestFolder::new();
+    folder.write("demo.control", "default_version = '1'\nrelocatable = true");
+    folder.write("demo--1.sql", "");
+    for setting in [
+        "default_version = '2'",
+        "directory = 'elsewhere'",
+        "schema = 'app'",
+    ] {
+        folder.write("demo--1.control", format!("# header\n{setting}"));
+        let output = folder.scan();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("demo--1.control:2:")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn matching_script_and_secondary_symlinks_are_unverified_not_missing() {
+    for name in ["demo--1.sql", "demo--1.control"] {
+        let folder = TestFolder::new();
+        folder.write("demo.control", "default_version = '1'");
+        std::os::unix::fs::symlink("missing-target", folder.path.join(name)).unwrap();
+        let error = pg_extshield::scan_extension(&folder.path).unwrap_err();
+        assert!(error.to_string().contains(name));
+        assert!(error.to_string().contains("cannot verify"));
+        assert!(error.to_string().contains("symbolic-link"));
+    }
+}
+
 struct McpClient {
     child: Child,
     input: ChildStdin,
@@ -293,6 +623,9 @@ fn mcp_discovers_tools_and_returns_the_shared_scanner_report() {
     folder.write("z.control", "default_version = '1.0'");
     folder.write("a.control", "# demo\ntrusted = true");
     folder.write("a--1.1.control", "comment = 'override'");
+    folder.write("a--1.1.sql", "");
+    folder.write("z--1.0.sql", "");
+    folder.write("orphan--1.control", "comment = 'orphan'");
     folder.write("notes.txt", "not a control file");
     let subfolder = folder.path.join("ignored.control");
     std::fs::create_dir(&subfolder).unwrap();
@@ -310,6 +643,11 @@ fn mcp_discovers_tools_and_returns_the_shared_scanner_report() {
         .unwrap();
     assert_eq!(scan["inputSchema"]["properties"]["path"]["type"], "string");
     assert_eq!(scan["inputSchema"]["required"], json!(["path"]));
+    assert!(
+        scan["inputSchema"]["properties"]
+            .get("installation_base")
+            .is_some()
+    );
 
     let response = client.request(
         4,
@@ -329,18 +667,29 @@ fn mcp_discovers_tools_and_returns_the_shared_scanner_report() {
     let report = &response["result"]["structuredContent"];
     let expected = pg_extshield::scan_extension(&folder.path).unwrap();
     assert_eq!(report, &serde_json::to_value(expected).unwrap());
-    assert_eq!(report["scanned_files"].as_array().unwrap().len(), 2);
-    assert_eq!(report["skipped_files"].as_array().unwrap().len(), 1);
+    assert_eq!(report["scanned_files"].as_array().unwrap().len(), 3);
     assert!(
-        report["skipped_files"][0]["reason"]
-            .as_str()
+        report["skipped_files"]
+            .as_array()
             .unwrap()
-            .contains("Version-specific")
+            .iter()
+            .any(|file| file["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Version-specific"))
     );
     assert_eq!(report["findings"][0]["rule_id"], "CTL-001");
     assert_eq!(report["findings"][0]["line"], 2);
     assert_eq!(report["findings"][1]["rule_id"], "CTL-003");
-    assert_eq!(report["rules_checked"], json!(["CTL-001", "CTL-003"]));
+    assert_eq!(report["findings"][0]["version"], "1.1");
+    assert_eq!(
+        report["rules_checked"],
+        json!(["CTL-001", "CTL-003", "CTL-004"])
+    );
+    assert_eq!(
+        report["extensions"][0]["versions"][0]["installation_path"],
+        json!(["1.1"])
+    );
     let text_report: Value =
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(&text_report, report);
@@ -365,12 +714,101 @@ fn mcp_distinguishes_no_input_files_from_no_findings() {
     );
 
     folder.write("demo.control", "default_version = '1.0'");
+    folder.write("demo--1.0.sql", "");
     let response = client.scan(&folder.path);
     let report = &response["result"]["structuredContent"];
     assert_eq!(response["result"]["isError"], false);
     assert_eq!(report["scanned_files"].as_array().unwrap().len(), 1);
     assert_eq!(report["findings"], json!([]));
-    assert_eq!(report["rules_checked"], json!(["CTL-001", "CTL-003"]));
+    assert_eq!(
+        report["rules_checked"],
+        json!(["CTL-001", "CTL-003", "CTL-004"])
+    );
+}
+
+#[test]
+fn mcp_accepts_installation_base_and_reports_paths_overrides_and_errors() {
+    let folder = TestFolder::new();
+    let base = TestFolder::new();
+    std::fs::create_dir(base.path.join("scripts")).unwrap();
+    folder.write(
+        "demo.control",
+        "default_version = '2'\ndirectory = 'scripts'",
+    );
+    base.write("scripts/demo--1.sql", "");
+    base.write("scripts/demo--1--2.sql", "");
+    base.write("scripts/demo--2.control", "# override\ntrusted = true");
+    let mut client = McpClient::start();
+
+    let response = client.scan(&folder.path);
+    assert_eq!(response["result"]["isError"], true);
+    assert!(response["result"].get("structuredContent").is_none());
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("installation base")
+    );
+
+    let arguments = json!({"path": folder.path, "installation_base": base.path});
+    let response = client.request(
+        6,
+        "tools/call",
+        json!({
+            "name": "scan_extension", "arguments": arguments.clone(),
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false);
+    let report = &response["result"]["structuredContent"];
+    let expected = pg_extshield::scan_extension_with_base(&folder.path, Some(&base.path)).unwrap();
+    assert_eq!(report, &serde_json::to_value(expected).unwrap());
+    assert_eq!(
+        report["extensions"][0]["versions"][1]["installation_path"],
+        json!(["1", "2"])
+    );
+    assert_eq!(report["findings"][0]["version"], "2");
+    assert_eq!(report["findings"][0]["line"], 2);
+    assert_eq!(
+        report["findings"][0]["file"],
+        json!(base.path.join("scripts/demo--2.control"))
+    );
+
+    base.write("scripts/demo--2.control", "default_version = '3'");
+    let response = client.request(
+        7,
+        "tools/call",
+        json!({
+            "name": "scan_extension", "arguments": arguments,
+        }),
+    );
+    assert_eq!(response["result"]["isError"], true);
+    assert!(response["result"].get("structuredContent").is_none());
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("demo--2.control:1:")
+    );
+
+    folder.write(
+        "demo.control",
+        "default_version = '1'\ndirectory = 'missing'",
+    );
+    let response = client.request(
+        8,
+        "tools/call",
+        json!({
+            "name": "scan_extension",
+            "arguments": {"path": folder.path, "installation_base": base.path},
+        }),
+    );
+    assert_eq!(response["result"]["isError"], true);
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cannot resolve script directory")
+    );
 }
 
 #[test]
@@ -412,6 +850,7 @@ fn mcp_rejects_missing_wrong_and_extra_arguments() {
         json!({}),
         json!({"path": 123}),
         json!({"path": ".", "extra": true}),
+        json!({"path": ".", "installation_base": 42}),
     ] {
         let response = client.request(
             5,

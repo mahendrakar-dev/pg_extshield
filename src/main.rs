@@ -15,13 +15,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use pg_extshield::{Finding, scan_extension};
+use pg_extshield::{Finding, scan_extension_with_base};
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ScanRequest {
     /// Folder on the server's machine. Use an absolute path to avoid ambiguity.
     path: PathBuf,
+    /// SHAREDIR or extension_control_path base. Required for relative directory settings.
+    installation_base: Option<PathBuf>,
 }
 
 struct PostgresExtShieldServer {
@@ -41,19 +43,22 @@ impl PostgresExtShieldServer {
     }
 
     #[tool(
-        description = "Read primary .control files directly inside an extension folder and run CTL-001 and CTL-003. Returns checked files, skipped version-specific files, findings, and limits. Does not execute extension code or inspect SQL, source, or binaries. No findings is not proof of safety."
+        description = "Check primary and version-specific controls and inventory SQL filenames for installation paths (CTL-001, CTL-003, CTL-004). Relative directory settings require installation_base (SHAREDIR or an extension_control_path base). Returns checked controls, script directories, candidate version paths, skipped files, findings, and limits. Does not read SQL contents or execute extension code. No findings is not proof of safety."
     )]
     async fn scan_extension(
         &self,
         request: Parameters<ScanRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        let path = request.0.path;
+        let ScanRequest {
+            path,
+            installation_base,
+        } = request.0;
         // File reading is blocking work, so keep it off the async worker threads.
-        let result = tokio::task::spawn_blocking(move || scan_extension(&path))
-            .await
-            .map_err(|error| {
-                ErrorData::internal_error(format!("scan worker failed: {error}"), None)
-            })?;
+        let result = tokio::task::spawn_blocking(move || {
+            scan_extension_with_base(&path, installation_base.as_deref())
+        })
+        .await
+        .map_err(|error| ErrorData::internal_error(format!("scan worker failed: {error}"), None))?;
         match result {
             Ok(report) => {
                 let value = serde_json::to_value(report).map_err(|error| {
@@ -79,17 +84,26 @@ impl ServerHandler for PostgresExtShieldServer {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Check primary .control files directly inside a folder.
+    /// Check extension controls and filename-based installation paths.
     #[command(after_long_help = "\
-Subfolders, symbolic links, SQL, source code, and compiled libraries are not checked.
-Version-specific files such as demo--1.0.control are skipped: they need to be
-combined with the primary control file before checking.
+Primary controls are discovered directly inside the supplied folder.
+Version-specific controls in the resolved script directory override the primary.
+Only that script directory is inventoried; there is no recursive search.
+Relative directory settings require --installation-base (SHAREDIR or a custom
+extension_control_path base). Absolute and omitted directory settings do not.
+Matching script/control symlinks cause an explicit verification error.
+SQL contents, source code, and compiled libraries are not read or executed.
 
 Exit codes: 0 = command completed, even with findings or no matching files;
 1 = scan error; 2 = invalid command-line arguments.
 The scan stops at the first error. No partial report is printed.
 No findings does not mean an extension is safe.")]
-    Scan { path: PathBuf },
+    Scan {
+        path: PathBuf,
+        /// SHAREDIR or custom extension_control_path base, not its extension subfolder.
+        #[arg(long)]
+        installation_base: Option<PathBuf>,
+    },
 
     /// Start the MCP server over stdin and stdout.
     Mcp,
@@ -112,7 +126,10 @@ async fn run_mcp() -> Result<(), Box<dyn Error>> {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Commands::Scan { path } => scan(&path),
+        Commands::Scan {
+            path,
+            installation_base,
+        } => scan(&path, installation_base.as_deref()),
         Commands::Mcp => run_mcp().await,
     };
 
@@ -124,42 +141,60 @@ async fn main() -> ExitCode {
         }
     }
 }
-fn scan(folder: &Path) -> Result<(), Box<dyn Error>> {
-    let report = scan_extension(folder)?;
+fn scan(folder: &Path, installation_base: Option<&Path>) -> Result<(), Box<dyn Error>> {
+    let report = scan_extension_with_base(folder, installation_base)?;
     for skipped in &report.skipped_files {
         println!(
-            "Skipped version-specific control file: {}",
-            skipped.path.display()
+            "Skipped file: {} ({})",
+            skipped.path.display(),
+            skipped.reason,
         );
     }
     for path in &report.scanned_files {
-        let findings: Vec<_> = report
-            .findings
-            .iter()
-            .filter(|finding| &finding.file == path)
-            .collect();
         println!("Checked control file: {}", path.display());
-        if findings.is_empty() {
-            println!("  No findings from the current control-file checks.");
-        } else {
-            for finding in findings {
-                print_finding(finding);
+    }
+    for extension in &report.extensions {
+        println!(
+            "Extension {}: script directory {}",
+            extension.name,
+            extension.script_directory.display()
+        );
+        for version in &extension.versions {
+            match &version.installation_path {
+                Some(path) => println!(
+                    "  Version {:?}: candidate installation path {}",
+                    version.version,
+                    path.join(" -> ")
+                ),
+                None => println!(
+                    "  Version {:?}: no installation path from inventoried scripts",
+                    version.version
+                ),
             }
         }
     }
+    for finding in &report.findings {
+        print_finding(finding);
+    }
 
-    if report.scanned_files.is_empty() {
+    if report.extensions.is_empty() {
         println!(
             "No primary .control files found in {}. No checks were run.",
             folder.display()
         );
     } else {
+        if report.findings.is_empty() {
+            println!("No findings from the current control-file and script-filename checks.");
+        }
         println!(
             "Scanned {} control file(s); {} finding(s).",
             report.scanned_files.len(),
             report.findings.len()
         );
-        println!("Only control-file checks ran. No findings does not mean the extension is safe.");
+        println!("No findings does not mean the extension is safe.");
+    }
+    for note in &report.notes {
+        println!("Note: {note}");
     }
     Ok(())
 }
@@ -174,6 +209,9 @@ fn print_finding(finding: &Finding) {
         None => println!("    File: {}", finding.file.display()),
     }
     println!("    Details: {}", finding.details);
+    if let Some(version) = &finding.version {
+        println!("    Version: {version:?}");
+    }
     println!("    Suggestion: {}", finding.remediation);
     if let Some(reference) = finding.cve_or_ref {
         println!("    Reference: {reference}");
